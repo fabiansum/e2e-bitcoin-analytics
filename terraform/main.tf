@@ -1,147 +1,156 @@
 terraform {
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 4.16"
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "=2.97.0"
     }
   }
 
   required_version = ">= 1.2.0"
 }
 
-provider "aws" {
-  region  = var.aws_region
-  profile = "default"
+provider "azurerm" {
+  features {}
 }
 
-# Create security group for access to EC2 from your Anywhere
-resource "aws_security_group" "sde_security_group" {
-  name        = "sde_security_group"
-  description = "Security group to allow inbound SCP & outbound 8080 (Airflow) connections"
-
-  ingress {
-    description = "Inbound SCP"
-    from_port   = 22
-    to_port     = 22
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+resource "azurerm_resource_group" "rg" {
+  name     = "bc-m-rg"
+  location = var.location
+  tags = {
+    environment = "dev"
   }
+}
 
-  egress {
-    from_port   = 0
-    to_port     = 0
-    protocol    = "-1"
-    cidr_blocks = ["0.0.0.0/0"]
+resource "azurerm_virtual_network" "vn" {
+  name                = "bc-m-network"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  address_space       = ["10.123.0.0/16"]
+
+  tags = {
+    environment = "dev"
   }
+}
 
-  egress {
-    from_port   = 8080
-    to_port     = 8080
-    protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"]
+resource "azurerm_subnet" "subnet" {
+  name                 = "bc-m-subnet"
+  resource_group_name  = azurerm_resource_group.rg.name
+  virtual_network_name = azurerm_virtual_network.vn.name
+  address_prefixes     = ["10.123.1.0/24"]
+}
+
+resource "azurerm_network_security_group" "sg" {
+  name                = "bc-m-sg"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  tags = {
+    environment = "dev"
+  }
+}
+
+resource "azurerm_public_ip" "ip" {
+  name                = "bc-m-ip"
+  resource_group_name = azurerm_resource_group.rg.name
+  location            = azurerm_resource_group.rg.location
+  allocation_method   = "Dynamic"
+
+  tags = {
+    environment = "dev"
+  }
+}
+
+resource "azurerm_network_interface" "nic" {
+  name                = "bc-m-nic"
+  location            = azurerm_resource_group.rg.location
+  resource_group_name = azurerm_resource_group.rg.name
+
+  ip_configuration {
+    name                          = "internal"
+    subnet_id                     = azurerm_subnet.subnet.id
+    private_ip_address_allocation = "Dynamic"
+    public_ip_address_id          = azurerm_public_ip.ip.id
   }
 
   tags = {
-    Name = "sde_security_group"
+    environment = "dev"
   }
 }
 
-# Create EC2 with IAM role to allow EMR, Redshift, & S3 access and security group 
-resource "tls_private_key" "custom_key" {
-  algorithm = "RSA"
-  rsa_bits  = 4096
-}
+resource "azurerm_linux_virtual_machine" "vm" {
+  name                  = "bc-m-vm"
+  resource_group_name   = azurerm_resource_group.rg.name
+  location              = azurerm_resource_group.rg.location
+  size                  = "Standard_DS1_v2"
+  admin_username        = "adminuser"
+  network_interface_ids = [azurerm_network_interface.nic.id]
 
-resource "aws_key_pair" "generated_key" {
-  key_name_prefix = var.key_name
-  public_key      = tls_private_key.custom_key.public_key_openssh
-}
+  custom_data = filebase64("customdata.tpl")
 
-data "aws_ami" "ubuntu" {
-  most_recent = true
-
-  filter {
-    name   = "name"
-    values = ["ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-20220420"]
+  admin_ssh_key {
+    username   = "adminuser"
+    public_key = file("~/.ssh/bcmazurekey.pub")
   }
 
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
+  os_disk {
+    caching              = "ReadWrite"
+    storage_account_type = "Standard_LRS"
   }
 
-  owners = ["099720109477"] # Canonical
-}
+  source_image_reference {
+    publisher = "Canonical"
+    offer     = "UbuntuServer"
+    sku       = "18.04-LTS"
+    version   = "latest"
+  }
 
-resource "aws_instance" "sde_ec2" {
-  ami           = data.aws_ami.ubuntu.id
-  instance_type = var.instance_type
+  provisioner "local-exec" {
+    command = templatefile("${var.host_os}-ssh-script.tpl", {
+      hostname     = self.public_ip_address,
+      user         = "adminuser",
+      identityfile = "~/.ssh/bcmazurekey"
+    })
+    interpreter = var.host_os == "windows" ? ["Powershell", "-Command"] : ["bash", "-c"]
+  }
 
-  key_name        = aws_key_pair.generated_key.key_name
-  security_groups = [aws_security_group.sde_security_group.name]
   tags = {
-    Name = "sde_ec2"
+    environment = "dev"
   }
-
-  user_data = <<EOF
-#!/bin/bash
-
-echo "-------------------------START SETUP---------------------------"
-sudo apt-get -y update
-
-sudo apt-get -y install \
-ca-certificates \
-curl \
-gnupg \
-lsb-release
-
-sudo apt -y install unzip
-
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /usr/share/keyrings/docker-archive-keyring.gpg
-
-echo \
-  "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/docker-archive-keyring.gpg] https://download.docker.com/linux/ubuntu \
-  $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-
-sudo apt-get -y update
-sudo apt-get -y install docker-ce docker-ce-cli containerd.io docker-compose-plugin
-sudo chmod 666 /var/run/docker.sock
-
-sudo apt install make
-
-echo 'Clone git repo to EC2'
-cd /home/ubuntu && git clone https://github.com/josephmachado/bitcoinMonitor.git
-
-echo 'CD to bitcoinMonitor directory'
-cd bitcoinMonitor
-
-echo 'Start containers'
-make up
-
-echo 'Run db migrations'
-sleep 120 && make warehouse-migration
-
-echo "-------------------------END SETUP---------------------------"
-
-EOF
-
 }
 
-# EC2 budget constraint
-resource "aws_budgets_budget" "ec2" {
-  name              = "budget-ec2-monthly"
-  budget_type       = "COST"
-  limit_amount      = "5"
-  limit_unit        = "USD"
-  time_period_end   = "2087-06-15_00:00"
-  time_period_start = "2022-10-22_00:00"
-  time_unit         = "MONTHLY"
+data "azurerm_public_ip" "ip-data" {
+  name                = azurerm_public_ip.ip.name
+  resource_group_name = azurerm_resource_group.rg.name
+}
+
+data "azurerm_subscription" "current" {}
+
+resource "azurerm_monitor_action_group" "notify_owner" {
+  name                = "notifyOwnerActionGroup"
+  resource_group_name = "example-resources"
+  short_name          = "notifyOwner"
+
+  email_receiver {
+    name          = "ownerEmail"
+    email_address = var.alert_contact_email
+  }
+}
+
+resource "azurerm_consumption_budget_subscription" "budget" {
+  name            = "subscription-budget-${data.azurerm_subscription.current.display_name}"
+  subscription_id = data.azurerm_subscription.current.id
+  amount          = var.budget_amount
+  time_grain      = "Monthly"
+
+  time_period {
+    start_date = formatdate("YYYY-MM-DD'T'HH:mm:ss'Z'", timestamp())
+    end_date   = formatdate("YYYY-MM-DD'T'HH:mm:ss'Z'", timeadd(timestamp(), "8760h")) # 1 year from now
+  }
 
   notification {
-    comparison_operator        = "GREATER_THAN"
-    threshold                  = 100
-    threshold_type             = "PERCENTAGE"
-    notification_type          = "FORECASTED"
-    subscriber_email_addresses = [var.alert_email_id]
+    enabled        = true
+    threshold      = 100.0
+    operator       = "GreaterThan"
+    contact_groups = [azurerm_monitor_action_group.notify_owner.id]
   }
 }

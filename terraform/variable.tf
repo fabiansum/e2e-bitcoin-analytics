@@ -5,23 +5,18 @@ variable "location" {
   default     = "East US"
 }
 
-## Key to allow connection to our VM instance
-variable "key_name" {
-  description = "Virtual machine key name"
-  type        = string
-  default     = "sde-key"
+variable "host_os" {
+  type = string
 }
 
-## EC2 instance type
-variable "instance_type" {
-  description = "Instance type for EMR and EC2"
-  type        = string
-  default     = "m4.xlarge"
+variable "budget_amount" {
+  description = "The amount for the budget"
+  type        = number
+  default     = 5
 }
 
-## Alert email receiver
-variable "alert_email_id" {
-  description = "Email id to send alerts to "
+variable "alert_contact_email" {
+  description = "Email address to receive budget alerts"
   type        = string
   default     = "bg_analytics@outlook.com"
 }
